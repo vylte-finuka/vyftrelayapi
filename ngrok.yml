@@ -1,0 +1,11 @@
+version: "2"
+authtoken: 2o8gw5KOuw2AS3ZoZvjQ7xT6s0s_6Ssi1wo36AnKUSncvGCN8
+
+tunnels:
+  rpc:
+    proto: http
+    addr: 8081
+
+  web:
+    proto: http
+    addr: 3000
