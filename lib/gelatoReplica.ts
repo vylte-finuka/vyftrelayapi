@@ -2,67 +2,62 @@
 import { ethers } from 'ethers';
 
 const RPC_URL = process.env.NEXT_PUBLIC_SLURA_RPC!;
-const RELAY_ADDRESS = "0x5C3C46Aa8A061153fA7C1F904B36d18Fc2E92E21"; // Ton GelatoRelay
+const RELAY_ADDRESS = "0x4C81f49E31bdA0DD164192690EFC5A34FBe32AEc";   // ← Mets ici la nouvelle adresse
 
 const provider = new ethers.JsonRpcProvider(RPC_URL);
 const sponsorWallet = new ethers.Wallet(process.env.PRIVATE_KEY_SPONSOR!, provider);
-
-// ABI correspondant à ton contrat GelatoRelay (callWithSyncFeeV2)
-const relayABI = [
-  "function callWithSyncFeeV2(address _target, bytes calldata _data, bool _isRelayContext, bytes32 _correlationId) external"
-];
-
-const relayContract = new ethers.Contract(RELAY_ADDRESS, relayABI, sponsorWallet);
 
 export interface CallWithSyncFeeRequest {
   chainId: number;
   target: string;
   data: string;
-  feeToken?: string;
-  maxFee?: string;
 }
 
 export class GelatoReplica {
   async callWithSyncFee(request: CallWithSyncFeeRequest) {
     const { target, data } = request;
 
-    console.log("[GelatoReplica] Envoi callWithSyncFeeV2 vers target:", target);
+    console.log("[GelatoReplica] Target →", target);
+    console.log("[GelatoReplica] Calldata length →", data);
 
     try {
-      // On génère un correlationId stable (important pour le status)
-      const correlationId = ethers.keccak256(ethers.toUtf8Bytes(Date.now().toString() + target));
+      const iface = new ethers.Interface([
+        "function callWithSyncFeeV2(address _target, bytes calldata _data, bool, bytes32) external"
+      ]);
 
-      const tx = await relayContract.callWithSyncFeeV2(
+      const callData = iface.encodeFunctionData("callWithSyncFeeV2", [
         target,
         data,
-        true,                    // _isRelayContext = true (recommandé)
-        correlationId
-      );
+        true,
+        ethers.keccak256(ethers.toUtf8Bytes("relay"))
+      ]);
 
-      console.log("Transaction envoyée, hash :", tx.hash);
+      const rawTx = {
+        to: RELAY_ADDRESS,
+        data: callData,
+        value: "0x0",
+        gasLimit: ethers.toBeHex(15_000_000),
+        maxFeePerGas: ethers.toBeHex(ethers.parseUnits("10", "gwei")),
+        maxPriorityFeePerGas: ethers.toBeHex(ethers.parseUnits("2", "gwei")),
+        nonce: await sponsorWallet.getNonce(),
+        chainId: (await provider.getNetwork()).chainId,
+        type: 2
+      };
 
-      const receipt = await tx.wait();
+      const signedTx = await sponsorWallet.signTransaction(rawTx);
+      const txHash = await provider.send("eth_sendRawTransaction", [signedTx]);
 
-      console.log("[GelatoReplica] Transaction confirmée ! Hash :", receipt.hash);
+      console.log("✅ Transaction envoyée via raw ! Hash :", txHash);
 
       return {
-        taskId: `self-relay-${receipt.hash.slice(2, 18)}`,   // taskId stable et lisible
-        txHash: receipt.hash,
-        blockNumber: receipt.blockNumber,
-        status: "success",
-        correlationId: correlationId
+        taskId: `self-relay-${txHash.slice(2, 20)}`,
+        txHash: txHash,
+        status: "pending"
       };
 
     } catch (error: any) {
-      console.error("Erreur lors de l'appel callWithSyncFeeV2 :", error);
-
-      // Fallback sécurisé
-      return {
-        taskId: "self-relay-warning",
-        txHash: "0x0000000000000000000000000000000000000000000000000000000000000000",
-        status: "warning",
-        message: error.message
-      };
+      console.error("❌ Erreur :", error.message);
+      return { taskId: "self-relay-warning", status: "warning", message: error.message };
     }
   }
 }
