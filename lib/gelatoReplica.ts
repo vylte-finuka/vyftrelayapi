@@ -2,7 +2,7 @@
 import { ethers } from 'ethers';
 
 const RPC_URL = process.env.NEXT_PUBLIC_SLURA_RPC!;
-const RELAY_ADDRESS = "0x4C81f49E31bdA0DD164192690EFC5A34FBe32AEc";   // ← Mets ici la nouvelle adresse
+const RELAY_ADDRESS = "0xAe28cFF3aB71b25d07b57fB071cF137fAde75988";   // VyftRelayTarget
 
 const provider = new ethers.JsonRpcProvider(RPC_URL);
 const sponsorWallet = new ethers.Wallet(process.env.PRIVATE_KEY_SPONSOR!, provider);
@@ -21,15 +21,15 @@ export class GelatoReplica {
     console.log("[GelatoReplica] Calldata length →", data);
 
     try {
-      const iface = new ethers.Interface([
-        "function callWithSyncFeeV2(address _target, bytes calldata _data, bool, bytes32) external"
+      // Interface pour la fonction execute du VyftRelayTarget
+      const relayInterface = new ethers.Interface([
+        "function execute(address target, bytes calldata data) external payable"
       ]);
 
-      const callData = iface.encodeFunctionData("callWithSyncFeeV2", [
+      // Encode l'appel à execute() avec le target et data fournis
+      const callData = relayInterface.encodeFunctionData("execute", [
         target,
-        data,
-        true,
-        ethers.keccak256(ethers.toUtf8Bytes("relay"))
+        data
       ]);
 
       const rawTx = {
@@ -47,7 +47,7 @@ export class GelatoReplica {
       const signedTx = await sponsorWallet.signTransaction(rawTx);
       const txHash = await provider.send("eth_sendRawTransaction", [signedTx]);
 
-      console.log("✅ Transaction envoyée via raw ! Hash :", txHash);
+      console.log("✅ Transaction envoyée via execute() ! Hash :", txHash);
 
       return {
         taskId: `self-relay-${txHash.slice(2, 20)}`,
