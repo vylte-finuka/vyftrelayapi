@@ -1,4 +1,4 @@
-// app/relays/v2/call-with-sync-fee/route.ts
+// pages/api/relays/v2/call-with-sync-fee.ts
 import { NextRequest, NextResponse } from 'next/server';
 import { gelato } from '../../../../lib/gelatoReplica';
 
@@ -18,30 +18,29 @@ export default async function POST(req: NextRequest) {
       chainId: body.chainId,
       target: body.target,
       data: body.data,
-      feeToken: body.feeToken || "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE",
     });
 
-    const realTxHash = result.txHash || "0x0";
+    console.log("✅ [Relay] Transaction soumise - Hash :", result.txHash);
 
-    console.log("✅ [Relay] Transaction exécutée - Hash réel :", realTxHash);
-
+    // Comme Gelato : la tâche est soumise, son exécution se suit via /api/tasks/status/{taskId}
     return NextResponse.json({
       taskId: result.taskId,
-      taskState: "Success",
-      transactionHash: realTxHash,        // Hash réel pour le client
-      blockNumber: result.blockNumber,
-      status: "success"
+      taskState: "CheckPending",
+      transactionHash: result.txHash,
+      status: "submitted",
     }, { status: 201 });
 
   } catch (error: any) {
-    console.error("❌ Relay Error:", error);
+    const message = error?.shortMessage || error?.reason || error?.message || "Erreur inconnue";
+    console.error("❌ Relay Error:", message);
 
+    // Échec réel : jamais de faux succès (le client ne doit pas croire à une exécution)
     return NextResponse.json({
-      taskId: "self-relay-warning",
-      taskState: "Success",
-      transactionHash: "0x0000000000000000000000000000000000000000000000000000000000000000",
-      message: error.message,
-      warning: true
-    }, { status: 201 });
+      taskId: "",
+      taskState: "Failed",
+      transactionHash: "",
+      message,
+      warning: true,
+    }, { status: 422 });
   }
 }
