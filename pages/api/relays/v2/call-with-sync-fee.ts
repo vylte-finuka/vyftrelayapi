@@ -2,6 +2,7 @@
 // Runtime Node.js (pas edge) : ethers y utilise le module https de Node au lieu de fetch,
 // dont l'implémentation edge refusait ses requêtes (fetch failed, UND_ERR_INVALID_ARG).
 import type { NextApiRequest, NextApiResponse } from 'next';
+import { ethers } from 'ethers';
 import { gelato } from '../../../../lib/gelatoReplica';
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
@@ -15,6 +16,12 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     if (!body?.target || !body?.data) {
       return res.status(400).json({ error: "target and data are required" });
     }
+    if (!ethers.isAddress(body.target)) {
+      return res.status(400).json({ error: "target must be a valid address" });
+    }
+    if (!ethers.isHexString(body.data)) {
+      return res.status(400).json({ error: "data must be a 0x-prefixed hex string" });
+    }
 
     console.log("➡️ [Relay] Réception callWithSyncFee - Target:", body.target);
 
@@ -23,6 +30,19 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       target: body.target,
       data: body.data,
     });
+
+    // Le relais ne throw plus quand le nœud refuse la tx : il renvoie status "reverted" + hash.
+    // Il ne faut donc pas répondre 201 dans ce cas (faux succès).
+    if (result.status === "reverted") {
+      console.error("❌ [Relay] Tx refusée - Hash :", result.txHash, "-", result.message);
+      return res.status(422).json({
+        taskId: result.taskId,
+        taskState: "Failed",
+        transactionHash: result.txHash,
+        message: result.message ?? "Transaction refusée par le nœud",
+        warning: true,
+      });
+    }
 
     console.log("✅ [Relay] Transaction soumise - Hash :", result.txHash);
 
