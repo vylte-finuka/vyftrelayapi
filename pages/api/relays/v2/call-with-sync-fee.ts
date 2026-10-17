@@ -1,15 +1,19 @@
 // pages/api/relays/v2/call-with-sync-fee.ts
-import { NextRequest, NextResponse } from 'next/server';
+// Runtime Node.js (pas edge) : ethers y utilise le module https de Node au lieu de fetch,
+// dont l'implémentation edge refusait ses requêtes (fetch failed, UND_ERR_INVALID_ARG).
+import type { NextApiRequest, NextApiResponse } from 'next';
 import { gelato } from '../../../../lib/gelatoReplica';
 
-export const runtime = 'edge';
+export default async function handler(req: NextApiRequest, res: NextApiResponse) {
+  if (req.method !== 'POST') {
+    return res.status(405).json({ error: "Method not allowed" });
+  }
 
-export default async function POST(req: NextRequest) {
   try {
-    const body = await req.json();
+    const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
 
-    if (!body.target || !body.data) {
-      return NextResponse.json({ error: "target and data are required" }, { status: 400 });
+    if (!body?.target || !body?.data) {
+      return res.status(400).json({ error: "target and data are required" });
     }
 
     console.log("➡️ [Relay] Réception callWithSyncFee - Target:", body.target);
@@ -23,12 +27,12 @@ export default async function POST(req: NextRequest) {
     console.log("✅ [Relay] Transaction soumise - Hash :", result.txHash);
 
     // Comme Gelato : la tâche est soumise, son exécution se suit via /api/tasks/status/{taskId}
-    return NextResponse.json({
+    return res.status(201).json({
       taskId: result.taskId,
       taskState: "CheckPending",
       transactionHash: result.txHash,
       status: "submitted",
-    }, { status: 201 });
+    });
 
   } catch (error: any) {
     const base = error?.shortMessage || error?.reason || error?.message || "Erreur inconnue";
@@ -42,12 +46,12 @@ export default async function POST(req: NextRequest) {
     console.error("❌ Relay Error:", message);
 
     // Échec réel : jamais de faux succès (le client ne doit pas croire à une exécution)
-    return NextResponse.json({
+    return res.status(422).json({
       taskId: "",
       taskState: "Failed",
       transactionHash: "",
       message,
       warning: true,
-    }, { status: 422 });
+    });
   }
 }
