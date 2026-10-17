@@ -31,7 +31,14 @@ export default async function POST(req: NextRequest) {
     }, { status: 201 });
 
   } catch (error: any) {
-    const message = error?.shortMessage || error?.reason || error?.message || "Erreur inconnue";
+    const base = error?.shortMessage || error?.reason || error?.message || "Erreur inconnue";
+    // "fetch failed" seul ne dit rien : préciser le RPC appelé et la cause réseau (ENOTFOUND, ECONNREFUSED…)
+    const cause = error?.cause?.code || error?.cause?.message || error?.error?.cause?.code;
+    let rpcHost = "non défini";
+    try {
+      rpcHost = new URL(process.env.NEXT_PUBLIC_SLURA_RPC || "").host || rpcHost;
+    } catch { /* RPC absent ou invalide */ }
+    const message = `${base}${cause ? ` (${cause})` : ""} — RPC : ${rpcHost}`;
     console.error("❌ Relay Error:", message);
 
     // Échec réel : jamais de faux succès (le client ne doit pas croire à une exécution)
