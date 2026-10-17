@@ -2,16 +2,17 @@
 import { ethers } from 'ethers';
 
 const RPC_URL = process.env.NEXT_PUBLIC_SLURA_RPC!;
+const RELAY_ADDRESS = process.env.VYFT_RELAY_ADDRESS ?? "0xAe28cFF3aB71b25d07b57fB071cF137fAde75988"; // VyftRelayTarget (à redéployer)
 
 const provider = new ethers.JsonRpcProvider(RPC_URL);
+const sponsorWallet = new ethers.Wallet(process.env.PRIVATE_KEY_SPONSOR!, provider);
 
-// Créé à la demande : une clé absente doit produire une erreur lisible, pas un crash au chargement
-function getSponsorWallet(): ethers.Wallet {
-  const key = process.env.PRIVATE_KEY_SPONSOR;
-  if (!key) throw new Error("PRIVATE_KEY_SPONSOR manquant dans l'environnement du relais");
-  if (!RPC_URL) throw new Error("NEXT_PUBLIC_SLURA_RPC manquant dans l'environnement du relais");
-  return new ethers.Wallet(key, provider);
-}
+const relayInterface = new ethers.Interface([
+  "function execute(address target, bytes data) payable returns (bool success, bytes returnData)",
+  "function executeBatch((address target, uint256 value, uint256 gasLimit, bytes data)[] calls, bool atomic) payable returns ((bool success, bytes returnData)[])",
+  "event Executed(bytes32 indexed id, address indexed relayer, address indexed target, uint256 value, bool success, bytes32 dataHash, bytes returnData)",
+  "event BatchExecuted(bytes32 indexed batchId, address indexed relayer, uint256 total, uint256 failed)"
+]);
 
 export interface CallWithSyncFeeRequest {
   chainId: number;
@@ -19,88 +20,94 @@ export interface CallWithSyncFeeRequest {
   data: string;
 }
 
-export interface CallWithSyncFeeResult {
-  taskId: string;
-  txHash: string;
+export interface BatchCall {
+  target: string;
+  data: string;
+  value?: bigint;
+  gasLimit?: bigint;
 }
 
-export type RelayTaskState = "CheckPending" | "ExecSuccess" | "ExecReverted";
+export interface RelayResult {
+  taskId: string;
+  txHash: string;
+  status: "pending" | "success" | "reverted";
+  innerSuccess?: boolean;
+  message?: string;
+}
 
-export interface RelayTaskStatus {
-  taskState: RelayTaskState;
-  transactionHash: string;
-  blockNumber: number;
-  message: string;
+async function send(callData: string, gasLimit = 15_000_000n): Promise<RelayResult> {
+  const nonce = await sponsorWallet.getNonce("pending");
+  const { chainId } = await provider.getNetwork();
+
+  const tx = {
+    to: RELAY_ADDRESS,
+    data: callData,
+    value: 0n,
+    gasLimit,
+    maxFeePerGas: ethers.parseUnits("10", "gwei"),
+    maxPriorityFeePerGas: ethers.parseUnits("2", "gwei"),
+    nonce,
+    chainId,
+    type: 2,
+  };
+
+  const signedTx = await sponsorWallet.signTransaction(tx);
+  // Le hash est déterministe : on l'a AVANT l'envoi, donc jamais de "warning" sans hash.
+  const txHash = ethers.keccak256(signedTx);
+
+  try {
+    await provider.send("eth_sendRawTransaction", [signedTx]);
+  } catch (e: any) {
+    const msg = String(e?.message ?? e);
+    // tx déjà connue du nœud => elle est bien en route, le hash reste valide
+    if (!/already known|known transaction|already imported/i.test(msg)) {
+      const seen = await provider.getTransaction(txHash).catch(() => null);
+      if (!seen) {
+        console.error("❌ Envoi refusé par le nœud :", msg);
+        return { taskId: `self-relay-${txHash.slice(2, 20)}`, txHash, status: "reverted", message: msg };
+      }
+    }
+  }
+
+  console.log("✅ Transaction envoyée via VyftRelayTarget. Hash :", txHash);
+  return { taskId: `self-relay-${txHash.slice(2, 20)}`, txHash, status: "pending" };
 }
 
 export class GelatoReplica {
-  /**
-   * Comme Gelato callWithSyncFee : la transaction est envoyée directement à `target`
-   * avec `data`, signée par le sponsor. Le taskId est le hash de la transaction.
-   * Lève une erreur (avec la raison) si l'appel échouerait ou si l'envoi échoue.
-   */
-  async callWithSyncFee(request: CallWithSyncFeeRequest): Promise<CallWithSyncFeeResult> {
-    const { target, data } = request;
-    const sponsorWallet = getSponsorWallet();
-
-    console.log("[GelatoReplica] Target →", target);
-    console.log("[GelatoReplica] Calldata →", data.slice(0, 10), `(${data.length} car.)`);
-
-    // Simulation : un revert du contrat (ex. "Unauthorized access") est signalé avant tout envoi
-    const gasEstimate = await provider.estimateGas({
-      from: sponsorWallet.address,
-      to: target,
-      data,
-    });
-
-    const rawTx = {
-      to: target,
-      data,
-      value: "0x0",
-      // Marge de 20 % + 21 000 sur l'estimation (BigInt() : cible de compilation < ES2020)
-      gasLimit: ethers.toBeHex((gasEstimate * BigInt(12)) / BigInt(10) + BigInt(21000)),
-      maxFeePerGas: ethers.toBeHex(ethers.parseUnits("10", "gwei")),
-      maxPriorityFeePerGas: ethers.toBeHex(ethers.parseUnits("2", "gwei")),
-      nonce: await sponsorWallet.getNonce("pending"),
-      chainId: (await provider.getNetwork()).chainId,
-      type: 2,
-    };
-
-    const signedTx = await sponsorWallet.signTransaction(rawTx);
-    const txHash: string = await provider.send("eth_sendRawTransaction", [signedTx]);
-
-    if (!/^0x[0-9a-fA-F]{64}$/.test(txHash)) {
-      throw new Error(`Hash de transaction invalide renvoyé par le RPC : ${txHash}`);
-    }
-
-    console.log("✅ Transaction envoyée à", target, "— Hash :", txHash);
-    return { taskId: txHash, txHash };
+  async callWithSyncFee(request: CallWithSyncFeeRequest): Promise<RelayResult> {
+    const callData = relayInterface.encodeFunctionData("execute", [request.target, request.data]);
+    return send(callData);
   }
 
-  /** Statut réel d'une tâche (taskId = hash de transaction) lu sur la chaîne. */
-  async getTaskStatus(taskId: string): Promise<RelayTaskStatus> {
-    if (!/^0x[0-9a-fA-F]{64}$/.test(taskId)) {
-      return {
-        taskState: "ExecReverted",
-        transactionHash: taskId,
-        blockNumber: 0,
-        message: "taskId inconnu (pas un hash de transaction)",
-      };
-    }
-    const receipt = await provider.getTransactionReceipt(taskId);
-    if (!receipt) {
-      return {
-        taskState: "CheckPending",
-        transactionHash: taskId,
-        blockNumber: 0,
-        message: "Transaction en attente de minage",
-      };
+  async callBatch(calls: BatchCall[], atomic = false): Promise<RelayResult> {
+    const payload = calls.map(c => ({
+      target: c.target,
+      value: c.value ?? 0n,
+      gasLimit: c.gasLimit ?? 0n,
+      data: c.data,
+    }));
+    const callData = relayInterface.encodeFunctionData("executeBatch", [payload, atomic]);
+    return send(callData, 30_000_000n);
+  }
+
+  /** Attend le minage et lit le vrai résultat interne depuis les events. */
+  async waitForResult(txHash: string): Promise<RelayResult> {
+    const receipt = await provider.waitForTransaction(txHash, 1, 120_000);
+    if (!receipt) return { taskId: `self-relay-${txHash.slice(2, 20)}`, txHash, status: "pending" };
+
+    let failed = 0;
+    for (const log of receipt.logs) {
+      try {
+        const parsed = relayInterface.parseLog(log);
+        if (parsed?.name === "Executed" && !parsed.args.success) failed++;
+      } catch { /* log étranger */ }
     }
     return {
-      taskState: receipt.status === 1 ? "ExecSuccess" : "ExecReverted",
-      transactionHash: taskId,
-      blockNumber: receipt.blockNumber,
-      message: receipt.status === 1 ? "Transaction exécutée" : "Transaction annulée par le contrat (revert)",
+      taskId: `self-relay-${txHash.slice(2, 20)}`,
+      txHash,
+      status: receipt.status === 1 ? "success" : "reverted",
+      innerSuccess: receipt.status === 1 && failed === 0,
+      message: failed ? `${failed} appel(s) interne(s) en échec (voir events Executed)` : undefined,
     };
   }
 }
