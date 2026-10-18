@@ -2,7 +2,7 @@
 import { ethers } from 'ethers';
 
 const RPC_URL = process.env.NEXT_PUBLIC_SLURA_RPC!;
-const RELAY_ADDRESS = process.env.VYFT_RELAY_ADDRESS ?? "0xAe28cFF3aB71b25d07b57fB071cF137fAde75988"; // VyftRelayTarget (à redéployer)
+const RELAY_ADDRESS = "0x5cbAb3a8db98Bd35e49334a87D8FE98D283d6c66"; // VyftRelayTarget (à redéployer)
 
 const provider = new ethers.JsonRpcProvider(RPC_URL);
 const sponsorWallet = new ethers.Wallet(process.env.PRIVATE_KEY_SPONSOR!, provider);
