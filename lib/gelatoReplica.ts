@@ -27,6 +27,13 @@ export interface BatchCall {
   gasLimit?: bigint;
 }
 
+export interface TaskStatus {
+  taskState: "CheckPending" | "ExecPending" | "ExecSuccess" | "ExecReverted" | "NotFound";
+  transactionHash?: string;
+  blockNumber?: number;
+  message?: string;
+}
+
 export interface RelayResult {
   taskId: string;
   txHash: string;
@@ -35,7 +42,26 @@ export interface RelayResult {
   message?: string;
 }
 
-async function send(callData: string, gasLimit = 15_000_000n): Promise<RelayResult> {
+// taskId = "self-relay-" + hash complet (sans 0x) : le hash est ainsi retrouvable pour /api/tasks/status.
+// (L'ancien format tronqué à 16 caractères ne permettait pas de retrouver la tx → 502.)
+export function makeTaskId(txHash: string): string {
+  return `self-relay-${txHash.slice(2)}`;
+}
+
+export function parseTaskId(taskId: string): string | null {
+  const m = /^self-relay-([0-9a-fA-F]{64})$/.exec(taskId);
+  return m ? `0x${m[1].toLowerCase()}` : null;
+}
+
+// File d'attente : évite que deux requêtes simultanées lisent le même nonce.
+let sendQueue: Promise<unknown> = Promise.resolve();
+function send(callData: string, gasLimit = 15_000_000n): Promise<RelayResult> {
+  const run = sendQueue.then(() => sendUnqueued(callData, gasLimit));
+  sendQueue = run.catch(() => undefined);
+  return run;
+}
+
+async function sendUnqueued(callData: string, gasLimit: bigint): Promise<RelayResult> {
   const nonce = await sponsorWallet.getNonce("pending");
   const { chainId } = await provider.getNetwork();
 
@@ -64,13 +90,13 @@ async function send(callData: string, gasLimit = 15_000_000n): Promise<RelayResu
       const seen = await provider.getTransaction(txHash).catch(() => null);
       if (!seen) {
         console.error("❌ Envoi refusé par le nœud :", msg);
-        return { taskId: `self-relay-${txHash.slice(2, 20)}`, txHash, status: "reverted", message: msg };
+        return { taskId: makeTaskId(txHash), txHash, status: "reverted", message: msg };
       }
     }
   }
 
   console.log("✅ Transaction envoyée via VyftRelayTarget. Hash :", txHash);
-  return { taskId: `self-relay-${txHash.slice(2, 20)}`, txHash, status: "pending" };
+  return { taskId: makeTaskId(txHash), txHash, status: "pending" };
 }
 
 export class GelatoReplica {
@@ -90,10 +116,52 @@ export class GelatoReplica {
     return send(callData, 30_000_000n);
   }
 
+  /** Statut Gelato-like d'une tâche, sans attendre : lit reçu + events Executed. */
+  async getTaskStatus(taskId: string): Promise<TaskStatus> {
+    const txHash = parseTaskId(taskId);
+    if (!txHash) {
+      return { taskState: "NotFound", message: "taskId invalide (format attendu : self-relay-<hash 64 hex>)" };
+    }
+
+    const receipt = await provider.getTransactionReceipt(txHash);
+    if (!receipt) {
+      const tx = await provider.getTransaction(txHash);
+      return tx
+        ? { taskState: "ExecPending", transactionHash: txHash, message: "Transaction en attente de minage" }
+        : { taskState: "CheckPending", transactionHash: txHash, message: "Transaction pas encore visible sur le nœud" };
+    }
+
+    if (receipt.status !== 1) {
+      return {
+        taskState: "ExecReverted",
+        transactionHash: txHash,
+        blockNumber: receipt.blockNumber,
+        message: "Transaction relais revertée",
+      };
+    }
+
+    let failed = 0;
+    for (const log of receipt.logs) {
+      try {
+        const parsed = relayInterface.parseLog(log);
+        if (parsed?.name === "Executed" && !parsed.args.success) failed++;
+      } catch { /* log étranger */ }
+    }
+
+    return failed
+      ? {
+          taskState: "ExecReverted",
+          transactionHash: txHash,
+          blockNumber: receipt.blockNumber,
+          message: `${failed} appel(s) interne(s) en échec (voir events Executed)`,
+        }
+      : { taskState: "ExecSuccess", transactionHash: txHash, blockNumber: receipt.blockNumber };
+  }
+
   /** Attend le minage et lit le vrai résultat interne depuis les events. */
   async waitForResult(txHash: string): Promise<RelayResult> {
     const receipt = await provider.waitForTransaction(txHash, 1, 120_000);
-    if (!receipt) return { taskId: `self-relay-${txHash.slice(2, 20)}`, txHash, status: "pending" };
+    if (!receipt) return { taskId: makeTaskId(txHash), txHash, status: "pending" };
 
     let failed = 0;
     for (const log of receipt.logs) {
@@ -103,7 +171,7 @@ export class GelatoReplica {
       } catch { /* log étranger */ }
     }
     return {
-      taskId: `self-relay-${txHash.slice(2, 20)}`,
+      taskId: makeTaskId(txHash),
       txHash,
       status: receipt.status === 1 ? "success" : "reverted",
       innerSuccess: receipt.status === 1 && failed === 0,
